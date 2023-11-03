@@ -17,6 +17,7 @@ import geopandas
 from shapely.geometry import shape
 from rasterio.features import shapes
 import logging
+from arcgis import GIS
 
 logging.basicConfig(level=logging.INFO)
 
@@ -90,8 +91,10 @@ class Snowpack:
         gdf.to_file(output)
         return output
 
+   
 
 if __name__ == '__main__':
+    resource_district_item = '5ccd439dd835451aa304468ebdce0427'
     input_dem= r"/mnt/w/srm/nel/Workarea/acagle/Data/Raster/dem25_cb.tif"
     sp = Snowpack('testbec',input_dem)
     #result = sp.classify_elevation(input_dem)
