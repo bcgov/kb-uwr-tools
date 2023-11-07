@@ -19,5 +19,5 @@ This is a repository of tools for evaluating current conditions of select [GAR U
 ```
 mamba create -n uwrtools -c conda-forge python>=3.11 geospatial jupyterlab jupyter-book
 mamba activate uwrtools
-mamba install -c esri arcgis>=2.2
+mamba install -c esri arcgis>=2.2 python-duckdb
 ```
