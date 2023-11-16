@@ -5,6 +5,7 @@ import logging
 import requests
 import geojson
 import geopandas
+import psutil
 
 from arcgis.gis import GIS
 from arcgis.features import FeatureSet
@@ -54,8 +55,24 @@ class WFS_downloader:
 
 
     def __init__(self) -> None:
-        pass
-
+        self.MEMORY_RATE = 0
+        self.CACHE_FILES = []
+    def __data_cache__(self,features):
+        ''' Cache data for large downloads
+        
+        '''
+        dump_count = len(self.CACHE_FILES)
+        cache_file = os.path.join(tempfile.gettempdir(),f'cache_{str(dump_count)}.parquet')
+        fc = geojson.FeatureCollection(features=features)
+        df = geopandas.GeoDataFrame.from_features(fc)
+        df.to_parquet(cache_file)
+        logging.info('Cached features: {cache_file}')
+        return True
+    def __load_cache__(self):
+        ''' load all cache data
+        TODO: figure out what happens to the cache
+        '''
+        return True
     def get_data(self, dataset,query=None, fields=None,bbox=None):
         '''Returns dataset in json format
         params:
@@ -70,6 +87,8 @@ class WFS_downloader:
         '''
 
         pagesize = self.PAGESIZE
+        availiable_memory = psutil.virtual_memory().available
+        logging.info("memory availiable: {}")
         r = self.wfs_query(dataset=dataset,query=query,fields=fields,bbox=bbox)
         matched = int(r.get('numberMatched'))
         returned = int(r.get('numberReturned'))
@@ -80,6 +99,17 @@ class WFS_downloader:
             r = self.wfs_query(dataset=dataset,query=query,fields=fields,bbox=bbox,start_index=start_index,count=pagesize)
             returned += int(r.get('numberReturned'))
             features = features + r.get('features')
+            self.MEMORY_RATE = psutil.virtual_memory().available - availiable_memory
+            if psutil.virtual_memory().available > psutil.virtual_memory().available + self.MEMORY_RATE:
+                # cache data to geojson
+                self.__data_cache__(features=features)
+                logging.error('availiable memory trigger')
+                # clear features
+                features = ()
+        if len(self.CACHE_FILES)>0:
+            # do we return a file here rather than an object since we know the 
+            # json object won't fit in memory
+            all_features = self.__load_cache__()
         return features    
 
     def wfs_query(self,dataset, query=None, fields=None,bbox=None,start_index = None, count=None): 
@@ -158,5 +188,6 @@ class WFS_downloader:
         df = geopandas.GeoDataFrame.from_features(fc)
         logging.debug(f'Loading Complete')
         return df
+    
     
 
