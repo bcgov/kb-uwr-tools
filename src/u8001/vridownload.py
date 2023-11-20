@@ -212,7 +212,7 @@ class WFS_downloader:
         '''
         logging.debug(f'Loading {len(features)} features to GeoDataFrame')
         fc = geojson.FeatureCollection(features=features)
-        df = geopandas.GeoDataFrame.from_features(fc)
+        df = geopandas.GeoDataFrame.from_features(fc['features'])
         logging.debug(f'Loading Complete')
         return df
     
