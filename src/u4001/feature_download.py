@@ -153,7 +153,7 @@ class WFS_downloader:
             features += current_features.get('features')
             logging.debug(f"features on deck {len(features)}")
             self.MEMORY_RATE = availiable_memory - psutil.virtual_memory().available
-            logging.info(f"memory rate {self.MEMORY_RATE}")
+            logging.debug(f"memory rate {self.MEMORY_RATE}")
             if not current_features:
                 break
 
