@@ -5,6 +5,7 @@ import logging
 import requests
 import geojson
 import geopandas
+import pandas
 import duckdb
 import psutil
 
@@ -32,11 +33,12 @@ class WFS_downloader:
         self.con.execute("LOAD spatial;")
         self.data_geom_column = None
         self.data_crs = None
-        self.max_retries = 4
+        self.max_retries = 5
+
 
     def create_bbox(self, aoi):
-        ''' Create bounding box coordinate tuple
-        '''
+        ''' Create bounding box coordinate tuple'''
+        
         if not isinstance(aoi, geopandas.GeoDataFrame):
             df=geopandas.read_file(aoi)
         else:
@@ -52,8 +54,8 @@ class WFS_downloader:
     
     
     def adjust_pagesize_by_memory(self, current_pagesize, available_memory):
-        '''Funtion to adjust page size by available memory at time function is called
-        '''
+        '''Funtion to adjust page size by available memory at time function is called'''
+        
         #in bytes
         if available_memory < self.memory_threshold:
             adjusted_pagesize=max(current_pagesize // 2, 1)
@@ -62,12 +64,11 @@ class WFS_downloader:
         else:
             return 10000
     
+    
     def __data_cache__(self,features):
-        ''' Cache data for large downloads
+        ''' Cache data for large downloads'''
         
-        '''
         if len(features) >0:
-            
             dump_count = len(self.CACHE_FILES)
             cache_file = os.path.join(self.CACHE_DIR,f'cache_{str(dump_count)}.parquet')
             fc = geojson.FeatureCollection(features=features)
@@ -75,27 +76,41 @@ class WFS_downloader:
             df.to_parquet(cache_file)
             self.CACHE_FILES.append(cache_file)
             logging.debug(f"chache file list {self.CACHE_FILES}")
-            logging.info(f'Cached features: {cache_file}')
+            logging.debug(f'Cached features: {cache_file}')
             self.offset = dump_count
             all_features=[]
             return True
-     
-    def __load_cache_to_dataframe__(self)->geopandas.GeoDataFrame:
-        ''' load all cache data
-        TODO: figure out what happens to the cache
-            
-            maybe this needs to just merge all the parquets and skip the df step?  
-        '''
-        logging.info('Loading cache to dataframe')
-        self.con.sql('DROP TABLE IF EXISTS wfs_data;')
-        sql = f"CREATE TABLE IF NOT EXISTS wfs_data AS \
-            SELECT * EXCLUDE {self.data_geom_column}, ST_GeomFromWKB({self.data_geom_column}) as {self.data_geom_column} FROM '{self.CACHE_DIR}/*.parquet'"
-        self.con.sql(sql)
-        df = self.con.sql(f'SELECT * EXCLUDE {self.data_geom_column},ST_AsText({self.data_geom_column}) as {self.data_geom_column}  FROM wfs_data').to_df()
-        df[self.data_geom_column] = geopandas.GeoSeries.from_wkt(df[self.data_geom_column])
-        gdf = geopandas.GeoDataFrame(df,geometry=self.data_geom_column,crs=self.data_crs)
-        return gdf
-      
+    
+    
+    def __load_cache_to_dataframe__(self) -> geopandas.GeoDataFrame:
+        '''Load all cache data and merge into one GeoParquet'''
+        logging.info('Loading cache to GeoDataFrame')
+
+        # Get a list of all Parquet files in the cache directory
+        parquet_files = [file for file in os.listdir(self.CACHE_DIR) if file.endswith('.parquet')]
+
+        # Check if there are any Parquet files in the cache directory
+        if not parquet_files:
+            logging.warning('No Parquet files found in the cache directory.')
+            return geopandas.GeoDataFrame()
+
+        # Read each Parquet file into a GeoDataFrame and store in a list
+        geo_dfs = []
+        for parquet_file in parquet_files:
+            file_path = os.path.join(self.CACHE_DIR, parquet_file)
+            geo_df = geopandas.read_parquet(file_path)
+            geo_dfs.append(geo_df)
+
+        # Concatenate all GeoDataFrames into one
+        concatenated_gdf = geopandas.GeoDataFrame(pandas.concat(geo_dfs, ignore_index=True))
+
+        # Update the crs if needed
+        if self.data_crs is not None:
+            concatenated_gdf.crs = self.data_crs
+
+        return concatenated_gdf
+    
+    
     def get_data(self, dataset, query=None, fields=None, bbox=None):
         '''Returns dataset in json format
         params:
@@ -116,7 +131,7 @@ class WFS_downloader:
         r = self.wfs_query(dataset=dataset, query=query, fields=fields, bbox=bbox)
         matched = int(r.get('numberMatched'))
         returned = int(r.get('numberReturned'))
-        logging.info(f"matched features {matched}")
+        logging.debug(f"matched features {matched}")
         logging.info(f"returned features {returned}")
         if self.data_crs is None:
             self.data_crs = r['crs']['properties']['name'].split('crs:')[1].replace('::', ':')
@@ -134,18 +149,17 @@ class WFS_downloader:
             current_features = self.wfs_query(dataset=dataset, query=query, fields=fields, bbox=bbox,
                                               start_index=start_index, count=pagesize)
             returned += int(current_features.get('numberReturned'))
-            logging.info(f"total Returned features {returned}")
+            logging.info(f"total returned features {returned}")
             features += current_features.get('features')
-            logging.info(f"features on deck {len(features)}")
+            logging.debug(f"features on deck {len(features)}")
             self.MEMORY_RATE = availiable_memory - psutil.virtual_memory().available
             logging.info(f"memory rate {self.MEMORY_RATE}")
             if not current_features:
                 break
 
             if len(features) >= pagesize:
-                logging.info(f"# of features {len(features)}")
+                logging.debug(f"# of features {len(features)}")
                 # Process the batch of features
-                logging.info("batch features")
                 self.__data_cache__(features=features)
                 
             features = []
@@ -160,6 +174,7 @@ class WFS_downloader:
             df = self.features_to_df(features=features)
 
         return df
+
 
     def wfs_query(self,dataset, query=None, fields=None,bbox=None,start_index = None, count=None): 
         '''Returns dataset in json format'''
@@ -202,9 +217,6 @@ class WFS_downloader:
             
         for attempt in range (self.max_retries):
             r = requests.get(url, params)
-            # r = requests.get(url, params, headers={'User-Agent':'MMozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246'})
-            # r = requests.get(url, params, headers={'User-Agent':'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:15.0) Gecko/20100101 Firefox/15.0.1'})
-            # r = requests.get(url, params, headers={'User-Agent':'Mozilla/5.0'})
             logging.debug(f"WFS URL request: {r.url}")
             if r.status_code == 502:
                 logging.warning(f"502 Bad Gateway. Retrying ({attempt + 1}/{self.max_retries})...")
@@ -221,6 +233,7 @@ class WFS_downloader:
         
         return r.json()
        
+       
     def features_to_df(self,features) -> geopandas.GeoDataFrame:
         ''' Creates Geopandas GeoDataFrame from 
             list of geojson features result
@@ -229,8 +242,34 @@ class WFS_downloader:
         usage:
             wfs.to_df(features)
         '''
-        logging.info(f'Loading {len(features)} features to GeoDataFrame')
+        logging.debug(f'Loading {len(features)} features to GeoDataFrame')
         fc = geojson.FeatureCollection(features=features)
         df = geopandas.GeoDataFrame.from_features(fc['features'])
-        logging.info(f'Loading Complete')
+        logging.debug(f'Loading Complete')
         return df
+    
+    
+    def features_to_geojson(self,features,output) ->str:
+        ''' Writes WFS result to geojson file
+        params:
+            wfs_result: json wfs response from get_data
+            output: output file path (str)
+        usage:
+            wfs.to_geojson(r,'T:/data/airports.geojson)
+        '''
+        collection = geojson.FeatureCollection(features=features)
+        with open(output,'w') as f:
+            geojson.dump(collection,f)
+            
+            
+    def geojson_from_file(self,geojson_file):
+        ''' Reads GeoJson file to list of features (GeoJSON)
+        params:
+            geojson_file: geojson file
+        returns: list of geojson features
+        usage:
+            wfs.features_from_geojson('T:/data/airports.geojson)
+        '''
+        with open(geojson_file,'r') as f:
+            obj = geojson.load(f)
+        return obj
