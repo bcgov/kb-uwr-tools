@@ -84,27 +84,21 @@ class WFS_downloader:
     
     def __load_cache_to_dataframe__(self) -> geopandas.GeoDataFrame:
         '''Load all cache data and merge into one GeoParquet'''
+     
         logging.info('Loading cache to GeoDataFrame')
-
-        # Get a list of all Parquet files in the cache directory
         parquet_files = [file for file in os.listdir(self.CACHE_DIR) if file.endswith('.parquet')]
-
-        # Check if there are any Parquet files in the cache directory
         if not parquet_files:
             logging.warning('No Parquet files found in the cache directory.')
             return geopandas.GeoDataFrame()
 
-        # Read each Parquet file into a GeoDataFrame and store in a list
         geo_dfs = []
         for parquet_file in parquet_files:
             file_path = os.path.join(self.CACHE_DIR, parquet_file)
             geo_df = geopandas.read_parquet(file_path)
             geo_dfs.append(geo_df)
 
-        # Concatenate all GeoDataFrames into one
         concatenated_gdf = geopandas.GeoDataFrame(pandas.concat(geo_dfs, ignore_index=True))
 
-        # Update the crs if needed
         if self.data_crs is not None:
             concatenated_gdf.crs = self.data_crs
 
@@ -159,7 +153,6 @@ class WFS_downloader:
 
             if len(features) >= pagesize:
                 logging.debug(f"# of features {len(features)}")
-                # Process the batch of features
                 self.__data_cache__(features=features)
                 
             features = []
