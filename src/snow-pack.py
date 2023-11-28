@@ -1,5 +1,5 @@
 """
-Snow-pack.py
+snow-pack.py
 Author: W.Burt
 Date: October, 2023
 
