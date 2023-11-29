@@ -5,45 +5,11 @@ import logging
 import requests
 import geojson
 import geopandas
+import pandas
 import duckdb
 import psutil
 
-from arcgis.gis import GIS
-from arcgis.features import FeatureSet
-from arcgis.geometry import Geometry
-from arcgis.geometry.filters import intersects
-
-
 logger = logging.getLogger(__name__)
-
-class ArcGIS_downloader:
-    '''
-    Downloads data from ArcGIS Online
-    '''
-    def __init__(self,url="https://www.arcgis.com",username=None,password=None) -> None:
-        try:
-            self.mh = GIS(url,username,password)
-            logging.debug(f'Connected to ArcGIS Online as user: {self.mh.user.username}')
-        except:
-            logging.debug('Failed to connect to ArcGIS Online')
-        pass
-    def download(self, item_id,query_str = "1=1", filter_geojson=None) -> str:
-        output = os.path.join(self.CACHE_DIR,'download.geojson')
-        dl_item = self.mh.content.get(item_id)
-        dl_layer = dl_item.layers[0]
-        if filter_geojson:
-            with open(r'W:\srm\nel\Local\Geomatics\Workarea\wburt\p2023\015_hlpo_tool_upgrade\boundary_tsa_4326.geojson') as f:
-                filter_json = json.load(f)
-                filter = FeatureSet.from_geojson(filter_json)
-            filter_geom = filter.features[0].geometry
-            filter_sr = filter.spatial_reference
-            filter_fun = intersects(filter_geom,filter_sr)
-        else:
-            filter_fun = None   
-        feat_set = dl_layer.query(where = query_str,geometry_filter=filter_fun)
-        with open(output,'w',encoding="utf-8") as f:
-            f.write(feat_set.to_geojson)
-        return
     
  
 class WFS_downloader:
@@ -56,9 +22,12 @@ class WFS_downloader:
 
 
     def __init__(self) -> None:
+        self.MEMORY_THRESHOLD =600000000    #memory threshold in bytes
         self.MEMORY_RATE = 0
         self.CACHE_FILES = []
         self.CACHE_DIR = tempfile.gettempdir()
+        self.MAX_RETRIES = 5
+        self.OFFSET=0
         self.con = duckdb.connect(database=':memory:')
         self.con.install_extension("httpfs")
         self.con.load_extension("httpfs")
@@ -66,33 +35,73 @@ class WFS_downloader:
         self.con.execute("LOAD spatial;")
         self.data_geom_column = None
         self.data_crs = None
-
-    def __data_cache__(self,features):
-        ''' Cache data for large downloads
         
-        '''
-        dump_count = len(self.CACHE_FILES)
-        cache_file = os.path.join(self.CACHE_DIR,f'cache_{str(dump_count)}.parquet')
-        fc = geojson.FeatureCollection(features=features)
-        df = geopandas.GeoDataFrame.from_features(fc)
-        df.to_parquet(cache_file)
-        self.CACHE_FILES.append(cache_file)
-        logging.info('Cached features: {cache_file}')
-        return True
-    def __load_cache_to_dataframe__(self)->geopandas.GeoDataFrame:
-        ''' load all cache data
-        TODO: figure out what happens to the cache
-        '''
-        logging.info('Loading cache to dataframe')
-        self.con.sql('DROP TABLE IF EXISTS wfs_data;')
-        sql = f"CREATE TABLE IF NOT EXISTS wfs_data AS \
-            SELECT * EXCLUDE {self.data_geom_column}, ST_GeomFromWKB({self.data_geom_column}) as {self.data_geom_column} FROM '{self.CACHE_DIR}/*.parquet'"
-        self.con.sql(sql)
-        df = self.con.sql(f'SELECT * EXCLUDE {self.data_geom_column},ST_AsText({self.data_geom_column}) as {self.data_geom_column}  FROM wfs_data').to_df()
-        df[self.data_geom_column] = geopandas.GeoSeries.from_wkt(df[self.data_geom_column])
-        gdf = geopandas.GeoDataFrame(df,geometry=self.data_geom_column,crs=self.data_crs)
-        return gdf
-    def get_data(self, dataset,query=None, fields=None,bbox=None):
+    def create_bbox(self, aoi):
+        ''' Create bounding box coordinate tuple'''
+        
+        if not isinstance(aoi, geopandas.GeoDataFrame):
+            df=geopandas.read_file(aoi)
+        else:
+            df=aoi
+        df=df.dissolve()
+        aoi_bounds= df.total_bounds.tolist()
+        bbox=['%.0f' % elem for elem in aoi_bounds]
+        bbox=[int(x) for x in bbox]
+        bbox.append("urn:ogc:def:crs:EPSG:3005")
+        bbox=tuple(bbox)
+        logging.info(f"Bounding box coords: {bbox}")
+        return bbox
+        
+    def adjust_pagesize_by_memory(self, current_pagesize, available_memory):
+        '''Funtion to adjust page size by available memory at time function is called'''
+        
+        #in bytes
+        if available_memory < self.MEMORY_THRESHOLD:
+            adjusted_pagesize=max(current_pagesize // 2, 1)
+            logging.info(f"Adjusting pagesize to {adjusted_pagesize} due to low memory.")
+            return adjusted_pagesize
+        else:
+            return 10000
+    
+    def __data_cache__(self,features):
+        ''' Cache data for large downloads'''
+        
+        if len(features) >0:
+            dump_count = len(self.CACHE_FILES)
+            cache_file = os.path.join(self.CACHE_DIR,f'cache_{str(dump_count)}.parquet')
+            fc = geojson.FeatureCollection(features=features)
+            df = geopandas.GeoDataFrame.from_features(fc['features'])
+            df.to_parquet(cache_file)
+            self.CACHE_FILES.append(cache_file)
+            logging.debug(f"chache file list {self.CACHE_FILES}")
+            logging.debug(f'Cached features: {cache_file}')
+            self.OFFSET = dump_count
+            all_features=[]
+            return True
+            
+    def __load_cache_to_dataframe__(self) -> geopandas.GeoDataFrame:
+        '''Load all cache data and merge into one GeoParquet'''
+     
+        logging.info('Loading cache to GeoDataFrame')
+        parquet_files = [file for file in os.listdir(self.CACHE_DIR) if file.endswith('.parquet')]
+        if not parquet_files:
+            logging.warning('No Parquet files found in the cache directory.')
+            return geopandas.GeoDataFrame()
+    
+        geo_dfs = []
+        for parquet_file in parquet_files:
+            file_path = os.path.join(self.CACHE_DIR, parquet_file)
+            geo_df = geopandas.read_parquet(file_path)
+            geo_dfs.append(geo_df)
+    
+        concatenated_gdf = geopandas.GeoDataFrame(pandas.concat(geo_dfs, ignore_index=True))
+    
+        if self.data_crs is not None:
+            concatenated_gdf.crs = self.data_crs
+    
+        return concatenated_gdf
+     
+    def get_data(self, dataset, query=None, fields=None, bbox=None):
         '''Returns dataset in json format
         params:
             query: CQL formated query
@@ -104,44 +113,60 @@ class WFS_downloader:
         r = wfs.get_data('WHSE_IMAGERY_AND_BASE_MAPS.GSR_AIRPORTS_SVW')
         TODO: discover OBJECTID , discover GEOMETRY Column name (SHAPE,GEOMETRY,geom,the_geom)
         '''
-
+        
         pagesize = self.PAGESIZE
         availiable_memory = psutil.virtual_memory().available
-        logging.info("memory availiable: {}")
-        r = self.wfs_query(dataset=dataset,query=query,fields=fields,bbox=bbox)
+        logging.info(f"Memory available: {availiable_memory}")
+    
+        r = self.wfs_query(dataset=dataset, query=query, fields=fields, bbox=bbox)
         matched = int(r.get('numberMatched'))
         returned = int(r.get('numberReturned'))
+        logging.debug(f"matched features {matched}")
+        logging.info(f"returned features {returned}")
         if self.data_crs is None:
-            self.data_crs = r['crs']['properties']['name'].split('crs:')[1].replace('::',':')
-        features = (r.get('features'))
+            self.data_crs = r['crs']['properties']['name'].split('crs:')[1].replace('::', ':')
+        features = r.get('features')
         if self.data_geom_column is None:
             self.data_geom_column = features[0]['geometry_name'].lower()
+    
         while returned < matched:
-            logging.info("")
+            
+            pagesize=self.adjust_pagesize_by_memory(self.PAGESIZE, psutil.virtual_memory().available)
+            logging.debug(f'page is {pagesize}')
+            
+            logging.debug("")
             start_index = returned
-            r = self.wfs_query(dataset=dataset,query=query,fields=fields,bbox=bbox,start_index=start_index,count=pagesize)
-            returned += int(r.get('numberReturned'))
-            features = features + r.get('features')
+            current_features = self.wfs_query(dataset=dataset, query=query, fields=fields, bbox=bbox,
+                                              start_index=start_index, count=pagesize)
+            returned += int(current_features.get('numberReturned'))
+            logging.info(f"total returned features {returned}")
+            features += current_features.get('features')
+            logging.debug(f"features on deck {len(features)}")
             self.MEMORY_RATE = availiable_memory - psutil.virtual_memory().available
-            if psutil.virtual_memory().available > psutil.virtual_memory().available + self.MEMORY_RATE:
-                # cache data to geojson
-                logging.info('availiable memory trigger')
+            logging.debug(f"memory rate {self.MEMORY_RATE}")
+            if not current_features:
+                break
+    
+            if len(features) >= pagesize:
+                logging.debug(f"# of features {len(features)}")
                 self.__data_cache__(features=features)
                 
-                # clear features
-                features = []
-        if len(self.CACHE_FILES)>0:
+            features = []
+                
+        if len(self.CACHE_FILES) > 0:
             # handle cached features
-            if len(features)>0:
+            if len(features) > 0:
                 self.__data_cache__(features=features)
                 features = []
             df = self.__load_cache_to_dataframe__()
         else:
             df = self.features_to_df(features=features)
+    
         return df
 
     def wfs_query(self,dataset, query=None, fields=None,bbox=None,start_index = None, count=None): 
         '''Returns dataset in json format'''
+        
         if fields is None:
             fields = []
         url = self.SERVICE_URL
@@ -152,6 +177,8 @@ class WFS_downloader:
             'outputFormat':'json',
             "srsName": "EPSG:3005",
             'sortBy':'OBJECTID',
+            'limit' : 10000,
+            'offset': self.OFFSET
             }
         # build optional params
         if bbox is not None and query is not None:
@@ -175,21 +202,25 @@ class WFS_downloader:
             params['startIndex'] = start_index
         if count:
             params['count'] = count
-
-        r = requests.get(url, params)
-        logging.debug(f"WFS URL request: {r.url}")
+            
+        for attempt in range (self.MAX_RETRIES):
+            r = requests.get(url, params)
+            logging.debug(f"WFS URL request: {r.url}")
+            if r.status_code == 502:
+                logging.warning(f"502 Bad Gateway. Retrying ({attempt + 1}/{self.MAX_RETRIES})...")
+            else:
+                break
+    
+        if r.status_code != 200:
+            logging.error(f"Error from WFS service. Status code: {r.status_code}")
+            return {}
+        
+        if not r.text:
+            logging.warning("Empty response received from WFS service.")
+            return {}
+        
         return r.json()
-    def features_to_geojson(self,features,output) ->str:
-        ''' Writes WFS result to geojson file
-        params:
-            wfs_result: json wfs response from get_data
-            output: output file path (str)
-        usage:
-            wfs.to_geojson(r,'T:/data/airports.geojson)
-        '''
-        collection = geojson.FeatureCollection(features=features)
-        with open(output,'w') as f:
-            geojson.dump(collection,f)
+
     def geojson_from_file(self,geojson_file):
         ''' Reads GeoJson file to list of features (GeoJSON)
         params:
@@ -215,6 +246,3 @@ class WFS_downloader:
         df = geopandas.GeoDataFrame.from_features(fc['features'])
         logging.debug(f'Loading Complete')
         return df
-    
-    
-
